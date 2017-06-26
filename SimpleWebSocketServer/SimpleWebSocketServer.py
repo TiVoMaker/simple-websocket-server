@@ -15,11 +15,14 @@ else:
 
 import hashlib
 import base64
+import json
 import socket
 import struct
 import ssl
+import time
 import errno
 import codecs
+from operator import attrgetter
 from collections import deque
 from select import select
 
@@ -72,6 +75,26 @@ PAYLOAD = 7
 MAXHEADER = 65536
 MAXPAYLOAD = 33554432
 
+
+class TimerEvent(object):
+
+    def __init__(self, callback, repeat, initial=None):
+        self.repeat = repeat
+        if not initial:
+            initial = repeat
+        self.next_event = time.time() + initial
+        self.callback = callback
+
+    def check(self, client, now):
+        if self.next_event <= now:
+            if self.repeat:
+                self.next_event = self.next_event + self.repeat
+            self.callback(client)
+            if not self.repeat:
+                return sys.float_info.max
+        return self.next_event
+
+
 class WebSocket(object):
 
    def __init__(self, server, sock, address):
@@ -100,6 +123,7 @@ class WebSocket(object):
       self.frag_decoder = codecs.getincrementaldecoder('utf-8')(errors='strict')
       self.closed = False
       self.sendq = deque()
+      self.timers = []
 
       self.state = HEADERB1
 
@@ -128,6 +152,27 @@ class WebSocket(object):
           Called when a websocket server gets a Close frame from a client.
       """
       pass
+
+   def setTimer(self, callback, repeat, initial=None):
+       timer = TimerEvent(callback, repeat, initial)
+       self.timers.append(timer)
+       self.timers.sort(key=attrgetter('next_event'))
+       return id(timer)
+
+   def clearTimer(self, timer_id):
+       for ndx in range(0, len(self.timers)):
+           t = self.timers[ndx]
+           if id(t) == timer_id:
+               self.timers.pop(ndx)
+               break
+
+   def checkTimers(self, now):
+       soonest = sys.float_info.max
+       for t in self.timers:
+           nxt = t.check(self, now)
+           if nxt < soonest:
+              soonest = nxt
+       return soonest
 
    def _handlePacket(self):
       if self.opcode == CLOSE:
@@ -607,6 +652,8 @@ class SimpleWebSocketServer(object):
 
    def serveforever(self):
       while True:
+         sel_int = sys.float_info.max
+         now = time.time()
          writers = []
          for fileno in self.listeners:
             if fileno == self.serversocket:
@@ -614,8 +661,16 @@ class SimpleWebSocketServer(object):
             client = self.connections[fileno]
             if client.sendq:
                writers.append(fileno)
+            next_int = client.checkTimers(now)
+            if next_int < sel_int:
+                sel_int = next_int
 
-         if self.selectInterval:
+         if sel_int < sys.float_info.max:
+            to_wait = sel_int - time.time()
+            if to_wait < 0:
+                to_wait = 0
+            rList, wList, xList = select(self.listeners, writers, self.listeners, to_wait)
+         elif self.selectInterval:
             rList, wList, xList = select(self.listeners, writers, self.listeners, self.selectInterval)
          else:
             rList, wList, xList = select(self.listeners, writers, self.listeners)
